@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AMCL &middot; Adaptive Monte Carlo Localization</title>
+<style>
+:root{
+  --hatch-widget-bg:#ffffff;
+  --hatch-widget-surface:#ffffff;
+  --hatch-widget-surface-muted:#f3f4f6;
+  --hatch-widget-text:#111827;
+  --hatch-widget-muted:#6b7280;
+  --hatch-widget-border:#d1d5db;
+  --hatch-widget-accent:#2563eb;
+  --hatch-widget-on-accent:#ffffff;
+  --hatch-widget-focus:#2563eb;
+  --hatch-widget-shadow:rgba(0,0,0,0.1);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --hatch-widget-bg:#111827;
+    --hatch-widget-surface:#1f2937;
+    --hatch-widget-surface-muted:#111827;
+    --hatch-widget-text:#f9fafb;
+    --hatch-widget-muted:#9ca3af;
+    --hatch-widget-border:#374151;
+    --hatch-widget-accent:#3b82f6;
+    --hatch-widget-on-accent:#ffffff;
+    --hatch-widget-focus:#3b82f6;
+    --hatch-widget-shadow:rgba(0,0,0,0.4);
+  }
+}
+body{margin:0;padding:16px;background:var(--hatch-widget-bg);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;}
+</style>
+</head>
+<body>
+<div style="box-sizing:border-box;max-width:560px;margin:0 auto;padding:10px;color:var(--hatch-widget-text);font-family:system-ui,-apple-system,'Segoe UI',sans-serif;">
+  <div style="font-size:15px;font-weight:600;">AMCL · Adaptive Monte Carlo Localization</div>
+  <div style="margin-top:8px;font-size:13px;line-height:1.55;color:var(--hatch-widget-muted);">AMCL (Adaptive Monte Carlo Localization) is a method for estimating a robot's pose on a known map from noisy motion and sensor data. It represents the belief as a set of weighted particles: each particle is a pose hypothesis, propagated with a motion model and weighted by how well its predicted laser scan matches the real one, then resampled so likely poses survive. The particle count adapts to uncertainty (KLD-sampling): many particles when lost, few when confident, and random particles are injected when the sensor likelihood drops. It is used to localize mobile robots, such as AMRs and self-driving vehicles, on maps built with SLAM, including recovery from the kidnapped-robot problem.</div>
+  <canvas id="amcl" width="420" height="420" style="width:100%;aspect-ratio:1/1;display:block;border:1px solid var(--hatch-widget-border);border-radius:10px;background:var(--hatch-widget-surface-muted);margin-top:8px;"></canvas>
+  <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;">
+    <button id="autoBtn" style="flex:1;padding:7px 10px;border-radius:8px;border:1px solid var(--hatch-widget-border);background:var(--hatch-widget-accent);color:var(--hatch-widget-on-accent);font-size:13px;">Auto</button>
+    <button id="stepBtn" style="flex:1;padding:7px 10px;border-radius:8px;border:1px solid var(--hatch-widget-border);background:var(--hatch-widget-surface);color:var(--hatch-widget-text);font-size:13px;">Step</button>
+    <button id="kidnapBtn" style="flex:1;padding:7px 10px;border-radius:8px;border:1px solid var(--hatch-widget-border);background:var(--hatch-widget-surface);color:var(--hatch-widget-text);font-size:13px;">Kidnap robot</button>
+    <button id="resetBtn" style="flex:1;padding:7px 10px;border-radius:8px;border:1px solid var(--hatch-widget-border);background:var(--hatch-widget-surface);color:var(--hatch-widget-text);font-size:13px;">Reset</button>
+  </div>
+  <div style="margin-top:10px;font-size:13px;">
+    <label style="display:flex;justify-content:space-between;"><span>Max particles</span><span id="maxNVal">1500</span></label>
+    <input id="maxN" type="range" min="200" max="3000" step="100" value="1500" style="width:100%;">
+    <label style="display:flex;justify-content:space-between;margin-top:6px;"><span>Motion noise</span><span id="motionVal">0.08</span></label>
+    <input id="motion" type="range" min="0" max="0.30" step="0.01" value="0.08" style="width:100%;">
+    <label style="display:flex;justify-content:space-between;margin-top:6px;"><span>Sensor noise (m)</span><span id="sensorVal">0.15</span></label>
+    <input id="sensor" type="range" min="0.05" max="0.50" step="0.01" value="0.15" style="width:100%;">
+  </div>
+  <div id="amclStats" style="margin-top:8px;font-size:13px;color:var(--hatch-widget-muted);"></div>
+  <div style="margin-top:6px;font-size:12px;color:var(--hatch-widget-muted);">Green: true pose &middot; Blue: estimated pose &middot; Dots: particles &middot; Gray: laser rays</div>
+</div>
+<script>
+(function(){
+  var W = 10, CW = 420, MARGIN = 10, SCALE = 40;
+  var walls = [
+    [0,0,10,0],[10,0,10,10],[10,10,0,10],[0,10,0,0],
+    [6,3.5,6,7],[2.5,6,5,6]
+  ];
+  var waypoints = [[1.5,2],[8.5,2],[8.5,8],[1.5,8]];
+  var NRAYS = 12, MAXRANGE = 15, MIN_N = 100;
+  var INJECT_MAX = 0.5, EPS = 0.05, ZDELTA = 2.3263;
+  var ALPHA_SLOW = 0.02, ALPHA_FAST = 0.2;
+  var llSlow = null, llFast = null, injectFrac = 0, lastQuality = 0;
+  var truePose = {x:1.5, y:2, th:0};
+  var wpIndex = 1, steps = 0;
+  var particles = [], weights = [];
+  var neff = 0, estPose = {x:0, y:0, th:0}, lastErr = 0, lastSpread = 0;
+  var running = false, timer = null;
+  var maxN = 1500, motionNoise = 0.08, sensorNoise = 0.15;
+
+  function randn(){
+    var u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    v = Math.random();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+  function wrapAngle(a){
+    while (a > Math.PI) a -= 2 * Math.PI;
+    while (a < -Math.PI) a += 2 * Math.PI;
+    return a;
+  }
+  function ptSegDist(px, py, x1, y1, x2, y2){
+    var dx = x2 - x1, dy = y2 - y1, L2 = dx * dx + dy * dy;
+    var t = L2 === 0 ? 0 : ((px - x1) * dx + (py - y1) * dy) / L2;
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+  }
+  function isFree(x, y, margin){
+    if (x <= 0 || x >= W || y <= 0 || y >= W) return false;
+    for (var i = 0; i < walls.length; i++){
+      var w = walls[i];
+      if (ptSegDist(x, y, w[0], w[1], w[2], w[3]) < margin) return false;
+    }
+    return true;
+  }
+  function randomFreePose(margin){
+    for (var t = 0; t < 200; t++){
+      var x = Math.random() * W, y = Math.random() * W;
+      if (isFree(x, y, margin)) return {x:x, y:y, th: Math.random() * 2 * Math.PI - Math.PI};
+    }
+    return {x:5, y:5, th:0};
+  }
+  function raycast(x, y, ang){
+    var dx = Math.cos(ang), dy = Math.sin(ang), best = MAXRANGE;
+    for (var i = 0; i < walls.length; i++){
+      var w = walls[i], x1 = w[0], y1 = w[1];
+      var sx = w[2] - x1, sy = w[3] - y1;
+      var den = sx * dy - dx * sy;
+      if (Math.abs(den) < 1e-9) continue;
+      var t = (sx * (y1 - y) - sy * (x1 - x)) / den;
+      var u = (dx * (y1 - y) - dy * (x1 - x)) / den;
+      if (t > 0.001 && u >= 0 && u <= 1 && t < best) best = t;
+    }
+    return best;
+  }
+  function scan(px, py, th, noisy){
+    var z = [];
+    for (var i = 0; i < NRAYS; i++){
+      var r = raycast(px, py, th + i * (2 * Math.PI / NRAYS));
+      if (noisy) r += randn() * sensorNoise;
+      z.push(Math.max(0.05, Math.min(MAXRANGE, r)));
+    }
+    return z;
+  }
+  function moveTrue(){
+    var wp = waypoints[wpIndex];
+    var dx = wp[0] - truePose.x, dy = wp[1] - truePose.y;
+    var dist = Math.hypot(dx, dy);
+    if (dist < 0.3){
+      wpIndex = (wpIndex + 1) % waypoints.length;
+      wp = waypoints[wpIndex];
+      dx = wp[0] - truePose.x; dy = wp[1] - truePose.y; dist = Math.hypot(dx, dy);
+    }
+    var dth = wrapAngle(Math.atan2(dy, dx) - truePose.th);
+    var rot = Math.max(-0.15, Math.min(0.15, dth));
+    truePose.th = wrapAngle(truePose.th + rot);
+    var trans = 0;
+    if (Math.abs(dth) < 0.6){
+      trans = Math.min(0.12, dist);
+      truePose.x += Math.cos(truePose.th) * trans;
+      truePose.y += Math.sin(truePose.th) * trans;
+    }
+    return {rot: rot, trans: trans};
+  }
+  function moveParticles(m){
+    for (var i = 0; i < particles.length; i++){
+      var p = particles[i];
+      var rot = m.rot + randn() * motionNoise;
+      var trans = m.trans + randn() * motionNoise * (0.2 + Math.abs(m.trans));
+      p.th = wrapAngle(p.th + rot);
+      p.x += Math.cos(p.th) * trans;
+      p.y += Math.sin(p.th) * trans;
+    }
+  }
+  function kldRequired(k){
+    if (k <= 1) return MIN_N;
+    var v = 1 - 2 / (9 * k) + ZDELTA * Math.sqrt(2 / (9 * k));
+    return Math.ceil(k * v * v * v / (2 * EPS));
+  }
+  function resampleKLD(frac){
+    var n = particles.length, cum = [], s = 0, i;
+    for (i = 0; i < n; i++){ s += weights[i]; cum.push(s); }
+    var bins = {}, k = 0, drawn = 0, out = [];
+    while (true){
+      var p;
+      if (Math.random() < frac) p = randomFreePose(0.4);
+      else {
+        var r = Math.random() * s, lo = 0, hi = n - 1;
+        while (lo < hi){ var mid = (lo + hi) >> 1; if (cum[mid] < r) lo = mid + 1; else hi = mid; }
+        p = particles[lo];
+      }
+      out.push({x:p.x, y:p.y, th:p.th});
+      drawn++;
+      var key = Math.floor(p.x / 0.5) + ',' + Math.floor(p.y / 0.5) + ',' + Math.floor((p.th + Math.PI) / (Math.PI / 6));
+      if (!bins[key]){ bins[key] = 1; k++; }
+      if (drawn >= MIN_N && (drawn >= kldRequired(k) || drawn >= maxN)) break;
+      if (drawn >= maxN) break;
+    }
+    particles = out;
+    weights = [];
+    for (i = 0; i < particles.length; i++) weights.push(1 / particles.length);
+  }
+  function update(){
+    var z = scan(truePose.x, truePose.y, truePose.th, true);
+    var sig = Math.max(sensorNoise, 0.15), sig2 = 2 * sig * sig;
+    var logNorm = NRAYS * Math.log(sig * Math.sqrt(2 * Math.PI));
+    var logw = [], maxL = -Infinity, i, r;
+    for (i = 0; i < particles.length; i++){
+      var p = particles[i], zp = scan(p.x, p.y, p.th, false), s = 0;
+      for (r = 0; r < NRAYS; r++){ var d = z[r] - zp[r]; s += d * d; }
+      var L = -s / sig2 - logNorm;
+      logw.push(L);
+      if (L > maxL) maxL = L;
+    }
+    var quality = 0;
+    for (i = 0; i < logw.length; i++) quality += Math.exp(logw[i]);
+    quality /= logw.length;
+    lastQuality = quality;
+    var llQ = Math.log(quality + 1e-300);
+    if (llSlow === null){ llSlow = llQ; llFast = llQ; }
+    llFast += ALPHA_FAST * (llQ - llFast);
+    llSlow += ALPHA_SLOW * (llQ - llSlow);
+    var ratio = Math.exp(llFast - llSlow);
+    injectFrac = Math.max(0, Math.min(INJECT_MAX, 1 - ratio));
+    var sum = 0;
+    weights = [];
+    for (i = 0; i < logw.length; i++){ var w = Math.exp(logw[i] - maxL); weights.push(w); sum += w; }
+    var sq = 0;
+    for (i = 0; i < weights.length; i++){ weights[i] /= sum; sq += weights[i] * weights[i]; }
+    neff = 1 / sq;
+    var mx = 0, my = 0, cs = 0, sn = 0;
+    for (i = 0; i < particles.length; i++){
+      var q = particles[i];
+      mx += weights[i] * q.x; my += weights[i] * q.y;
+      cs += weights[i] * Math.cos(q.th); sn += weights[i] * Math.sin(q.th);
+    }
+    estPose = {x: mx, y: my, th: Math.atan2(sn, cs)};
+    lastErr = Math.hypot(estPose.x - truePose.x, estPose.y - truePose.y);
+    var vs = 0;
+    for (i = 0; i < particles.length; i++){
+      var q2 = particles[i];
+      vs += weights[i] * ((q2.x - mx) * (q2.x - mx) + (q2.y - my) * (q2.y - my));
+    }
+    lastSpread = Math.sqrt(vs);
+    resampleKLD(injectFrac);
+  }
+  function step(){
+    var m = moveTrue();
+    moveParticles(m);
+    update();
+    steps++;
+    draw();
+    updateStats();
+  }
+  function kidnap(){
+    truePose = randomFreePose(0.4);
+    draw();
+    updateStats();
+  }
+  function init(){
+    truePose = {x:1.5, y:2, th:0};
+    wpIndex = 1; steps = 0;
+    particles = [];
+    for (var i = 0; i < maxN; i++) particles.push(randomFreePose(0.4));
+    weights = [];
+    for (i = 0; i < particles.length; i++) weights.push(1 / particles.length);
+    neff = particles.length;
+    estPose = {x:0, y:0, th:0}; lastErr = 0; lastSpread = 0;
+    draw();
+    updateStats();
+  }
+  function px(x){ return MARGIN + x * SCALE; }
+  function py(y){ return CW - MARGIN - y * SCALE; }
+  function drawTriangle(ctx, x, y, th, size, color){
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(px(x) + Math.cos(th) * size, py(y) - Math.sin(th) * size);
+    ctx.lineTo(px(x) + Math.cos(th + 2.5) * size, py(y) - Math.sin(th + 2.5) * size);
+    ctx.lineTo(px(x) + Math.cos(th - 2.5) * size, py(y) - Math.sin(th - 2.5) * size);
+    ctx.closePath();
+    ctx.fill();
+  }
+  function draw(){
+    var canvas = document.getElementById('amcl');
+    var ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, CW, CW);
+    ctx.strokeStyle = '#374151';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (var i = 0; i < walls.length; i++){
+      var w = walls[i];
+      ctx.moveTo(px(w[0]), py(w[1]));
+      ctx.lineTo(px(w[2]), py(w[3]));
+    }
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(107,114,128,0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var r = 0; r < NRAYS; r++){
+      var a = truePose.th + r * (2 * Math.PI / NRAYS);
+      var d = raycast(truePose.x, truePose.y, a);
+      ctx.moveTo(px(truePose.x), py(truePose.y));
+      ctx.lineTo(px(truePose.x + Math.cos(a) * d), py(truePose.y + Math.sin(a) * d));
+    }
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(37,99,235,0.55)';
+    for (i = 0; i < particles.length; i++){
+      var p = particles[i];
+      ctx.fillRect(px(p.x) - 1, py(p.y) - 1, 2, 2);
+    }
+    drawTriangle(ctx, truePose.x, truePose.y, truePose.th, 9, '#16a34a');
+    drawTriangle(ctx, estPose.x, estPose.y, estPose.th, 7, '#2563eb');
+  }
+  function updateStats(){
+    document.getElementById('amclStats').textContent =
+      'Step ' + steps + ' · Particles ' + particles.length +
+      ' · Neff ' + Math.round(neff) +
+      ' · Error ' + lastErr.toFixed(2) + ' m · Spread ' + lastSpread.toFixed(2) + ' m · Inject ' + Math.round(injectFrac * 100) + '%';
+  }
+  document.getElementById('stepBtn').addEventListener('click', step);
+  document.getElementById('kidnapBtn').addEventListener('click', kidnap);
+  document.getElementById('resetBtn').addEventListener('click', init);
+  document.getElementById('autoBtn').addEventListener('click', function(){
+    running = !running;
+    this.textContent = running ? 'Stop' : 'Auto';
+    if (running) timer = setInterval(step, 120);
+    else clearInterval(timer);
+  });
+  document.getElementById('maxN').addEventListener('input', function(){
+    maxN = parseInt(this.value, 10);
+    document.getElementById('maxNVal').textContent = this.value;
+  });
+  document.getElementById('motion').addEventListener('input', function(){
+    motionNoise = parseFloat(this.value);
+    document.getElementById('motionVal').textContent = motionNoise.toFixed(2);
+  });
+  document.getElementById('sensor').addEventListener('input', function(){
+    sensorNoise = parseFloat(this.value);
+    document.getElementById('sensorVal').textContent = sensorNoise.toFixed(2);
+  });
+  window.__amcl = function(){
+    return {n: particles.length, neff: neff, err: lastErr, spread: lastSpread, inj: injectFrac, q: lastQuality, qs: llSlow, qf: llFast, steps: steps,
+            tx: truePose.x, ty: truePose.y, ex: estPose.x, ey: estPose.y};
+  };
+  window.__amclStep = step;
+  window.__amclKidnap = kidnap;
+  init();
+})();
+</script>
+
+</body>
+</html>
