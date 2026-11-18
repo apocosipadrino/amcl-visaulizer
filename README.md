@@ -22,4 +22,3 @@ A robot drives a waypoint loop in a 10×10 m map with two inner walls, sensing t
 ## Notes
 
 - The fast/slow likelihood averages use α_fast = 0.2 and α_slow = 0.02, tuned for the demo timescale (the textbook values assume thousands of updates).
-- Enable GitHub Pages (Settings → Pages, deploy from main) to run it at https://apocosipadrino.github.io/amcl-visaulizer/
